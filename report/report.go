@@ -34,13 +34,17 @@ import (
 type Report struct {
 	*prom.EmbeddedPrometheus
 	reportDate time.Time
+	baseDir    string
 }
 
 func New(e *prom.EmbeddedPrometheus) *Report {
-	return &Report{
+	r := &Report{
 		EmbeddedPrometheus: e,
 		reportDate:         time.Now(),
 	}
+	r.baseDir = fmt.Sprintf("report_%s", r.reportDate.Format("2006_01_02T15_04_05"))
+	os.Mkdir(r.baseDir, os.ModePerm)
+	return r
 }
 
 func (r *Report) Generate() {
@@ -51,32 +55,59 @@ func (r *Report) Generate() {
 	_ = r.MemoryPoolsLabels()
 }
 
-func (r *Report) PlotMemoryArea(area string) {
-	result := r.EmbeddedPrometheus.ExecuteRangeQuery(fmt.Sprintf(`jvm_memory_bytes_used{area="%s"}`, area), 1*time.Hour)
+func (r *Report) GenerateSeries(name, query string, d time.Duration) *chart.TimeSeries {
+	result := r.EmbeddedPrometheus.ExecuteRangeQuery(query, d)
 	if result.Err != nil {
 		log.Fatalf("Could not execute query: err=%s", result.Err.Error())
 	}
 
-	used := chart.ContinuousSeries{
-		Name: fmt.Sprintf("Used memory [%s]", area),
+	ts := chart.TimeSeries{
+		Name: name,
 	}
 	switch v := result.Value.(type) {
 	case promql.Matrix:
+		log.Printf("==== Matrix ===\n%#v\n", v)
 		for _, item := range v {
-			used.XValues = append(used.XValues, item.Points[0].V)
-			used.YValues = append(used.XValues, item.Points[1].V)
+			log.Print(item.Points)
+			ts.XValues = append(ts.XValues, time.Unix(item.Points[0].T, 0))
+			ts.YValues = append(ts.YValues, item.Points[0].V)
 		}
 	}
+
+	return &ts
+}
+
+func (r *Report) PlotMemoryArea(area string) {
+	used := r.GenerateSeries(
+		fmt.Sprintf("Used memory [%s]", area),
+		fmt.Sprintf(`jvm_memory_bytes_used{area="%s"}`, area),
+		1*time.Hour)
+
+	max := r.GenerateSeries(
+		fmt.Sprintf("Max memory [%s]", area),
+		fmt.Sprintf(`jvm_memory_bytes_max{area="%s"}`, area),
+		1*time.Hour)
+
+	usage := r.GenerateSeries(
+		fmt.Sprintf("Usage memory [%s]", area),
+		fmt.Sprintf(`jvm_memory_bytes_used{area="%s"} / jvm_memory_bytes_max >= 0`, area),
+		1*time.Hour)
 
 	graph := chart.Chart{
 		Series: []chart.Series{
 			used,
+			max,
+			usage,
 		},
 	}
 
-	f, _ := os.Create(fmt.Sprintf("memory_area_%s.png", r.reportDate.Format("2006_01_02T15_04_05")))
+	f, _ := os.Create(r.genFilename(fmt.Sprintf("memory_area_%s", area)))
 	defer f.Close()
 	graph.Render(chart.SVG, f)
+}
+
+func (r *Report) genFilename(plot string) string {
+	return fmt.Sprintf("%s/%s.svg", r.baseDir, plot)
 }
 
 func (r *Report) MemoryAreaLabels() []string {
