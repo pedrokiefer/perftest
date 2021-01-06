@@ -123,8 +123,8 @@ func (ep *EmbeddedPrometheus) ExecuteRangeQuery(expr string, r time.Duration) *p
 	query, err := engine.NewRangeQuery(
 		ep.Storage,
 		expr,
-		timestamp.Time(begin.Unix()), timestamp.Time(end.Unix()),
-		15*time.Second)
+		begin, end,
+		time.Second)
 
 	if err != nil {
 		log.Fatalf("Could not create query: err=%s", err.Error())

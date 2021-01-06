@@ -67,10 +67,11 @@ func (r *Report) GenerateSeries(name, query string, d time.Duration) *chart.Time
 	switch v := result.Value.(type) {
 	case promql.Matrix:
 		log.Printf("==== Matrix ===\n%#v\n", v)
-		for _, item := range v {
-			log.Print(item.Points)
-			ts.XValues = append(ts.XValues, time.Unix(item.Points[0].T, 0))
-			ts.YValues = append(ts.YValues, item.Points[0].V)
+		for _, serie := range v {
+			for _, s := range serie.Points {
+				ts.XValues = append(ts.XValues, time.Unix(s.T, 0))
+				ts.YValues = append(ts.YValues, s.V)
+			}
 		}
 	}
 

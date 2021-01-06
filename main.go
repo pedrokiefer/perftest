@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/galeb/perftest/client"
 	"github.com/galeb/perftest/prom"
 	"github.com/galeb/perftest/report"
 )
@@ -33,7 +34,7 @@ func main() {
 	p := prom.New(metrics, time.Duration(10)*time.Second)
 	p.Start()
 
-	_, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	// for i := 0; i < parallel; i++ {
 	// 	log.Printf("%d parallel started", i)
 	// 	go func() {
@@ -63,21 +64,20 @@ func main() {
 	// 	}
 	// }()
 
-	// // __info__
-	// go func() {
-	// 	for {
-	// 		log.Print("picked: [__info__]")
-	// 		select {
-	// 		case <-time.After(30 * time.Second):
-	// 			client.DoFireAndForgetHTTPReq(endpoint, "__info__", 10*time.Second, nil, nil)
-	// 		case <-ctx.Done():
-	// 			return
-	// 		}
-	// 	}
-	// }()
+	// __info__
+	go func() {
+		for {
+			select {
+			case <-time.After(30 * time.Second):
+				client.DoFireAndForgetHTTPReq(endpoint, "__info__", 10*time.Second, nil, nil)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	select {
-	case <-time.After(30 * time.Second):
+	case <-time.After(time.Duration(testDuration) * time.Minute):
 		cancel()
 	}
 
