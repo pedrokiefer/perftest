@@ -48,11 +48,23 @@ func New(e *prom.EmbeddedPrometheus) *Report {
 }
 
 func (r *Report) Generate() {
-	memoryAreas := r.MemoryAreaLabels()
-	for _, l := range memoryAreas {
-		r.PlotMemoryArea(l)
+	images := []string{
+		r.PlotRequests(),
+		r.PlotRequestsErrors(),
+		r.PlotOpenFileDescriptors(),
 	}
-	_ = r.MemoryPoolsLabels()
+
+	memoryAreas := r.MemoryAreaLabels()
+	log.Printf("Memory Areas: %#v", memoryAreas)
+	for _, l := range memoryAreas {
+		images = append(images, r.PlotMemoryArea(l))
+	}
+
+	memoryPools := r.MemoryPoolsLabels()
+	log.Printf("Memory Pools: %#v", memoryPools)
+	for _, l := range memoryPools {
+		images = append(images, r.PlotMemoryPool(l))
+	}
 }
 
 func (r *Report) GenerateSeries(name, query string, d time.Duration) *chart.TimeSeries {
@@ -60,16 +72,14 @@ func (r *Report) GenerateSeries(name, query string, d time.Duration) *chart.Time
 	if result.Err != nil {
 		log.Fatalf("Could not execute query: err=%s", result.Err.Error())
 	}
-
 	ts := chart.TimeSeries{
 		Name: name,
 	}
 	switch v := result.Value.(type) {
 	case promql.Matrix:
-		log.Printf("==== Matrix ===\n%#v\n", v)
 		for _, serie := range v {
 			for _, s := range serie.Points {
-				ts.XValues = append(ts.XValues, time.Unix(s.T, 0))
+				ts.XValues = append(ts.XValues, time.Unix(s.T/1000, 0))
 				ts.YValues = append(ts.YValues, s.V)
 			}
 		}
@@ -78,7 +88,154 @@ func (r *Report) GenerateSeries(name, query string, d time.Duration) *chart.Time
 	return &ts
 }
 
-func (r *Report) PlotMemoryArea(area string) {
+func (r *Report) GenerateMultiSeries(query string, d time.Duration) []chart.Series {
+	result := r.EmbeddedPrometheus.ExecuteRangeQuery(query, d)
+	if result.Err != nil {
+		log.Fatalf("Could not execute query: err=%s", result.Err.Error())
+	}
+	series := []chart.Series{}
+	switch v := result.Value.(type) {
+	case promql.Matrix:
+		for _, serie := range v {
+			vhost := serie.Metric.Get("virtualhost")
+			ts := chart.TimeSeries{
+				Name: vhost,
+			}
+			for _, s := range serie.Points {
+				ts.XValues = append(ts.XValues, time.Unix(s.T/1000, 0))
+				ts.YValues = append(ts.YValues, s.V)
+			}
+			series = append(series, ts)
+		}
+	}
+
+	return series
+}
+
+func ByteCountSI(v interface{}) string {
+	b := int(v.(float64))
+	const unit = 1000
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB",
+		float64(b)/float64(div), "kMGTPE"[exp])
+}
+
+func (r *Report) PlotRequests() string {
+	requests := r.GenerateMultiSeries(
+		"sum(rate(galeb_http_requests_total[1m])) by (virtualhost)",
+		1*time.Hour)
+
+	graph := chart.Chart{
+		Background: chart.Style{
+			Padding: chart.Box{
+				Bottom: 20,
+			},
+		},
+		YAxis: chart.YAxis{
+			Name: "Requests / minute",
+		},
+		XAxis: chart.XAxis{
+			ValueFormatter: chart.TimeMinuteValueFormatter,
+			GridMajorStyle: chart.Style{
+				StrokeColor: chart.ColorAlternateGray,
+				StrokeWidth: 1.0,
+			},
+		},
+		Series: requests,
+	}
+
+	graph.Elements = []chart.Renderable{
+		chart.LegendThin(&graph),
+	}
+
+	f, _ := os.Create(r.genFilename("requests"))
+	defer f.Close()
+	graph.Render(chart.PNG, f)
+
+	return "requests"
+}
+
+func (r *Report) PlotRequestsErrors() string {
+	requests := r.GenerateMultiSeries(
+		"sum(rate(galeb_errors_total[1m])) by (virtualhost, error)",
+		1*time.Hour)
+
+	graph := chart.Chart{
+		Background: chart.Style{
+			Padding: chart.Box{
+				Bottom: 20,
+			},
+		},
+		YAxis: chart.YAxis{
+			Name: "Requests / minute",
+		},
+		XAxis: chart.XAxis{
+			ValueFormatter: chart.TimeMinuteValueFormatter,
+			GridMajorStyle: chart.Style{
+				StrokeColor: chart.ColorAlternateGray,
+				StrokeWidth: 1.0,
+			},
+		},
+		Series: requests,
+	}
+
+	graph.Elements = []chart.Renderable{
+		chart.LegendThin(&graph),
+	}
+
+	f, _ := os.Create(r.genFilename("requests_errors"))
+	defer f.Close()
+	graph.Render(chart.PNG, f)
+
+	return "requests_errors"
+}
+
+func (r *Report) PlotOpenFileDescriptors() string {
+	fds := r.GenerateSeries(
+		"Open File Descriptors",
+		"process_open_fds",
+		1*time.Hour)
+
+	graph := chart.Chart{
+		Background: chart.Style{
+			Padding: chart.Box{
+				Bottom: 20,
+			},
+		},
+		YAxis: chart.YAxis{
+			Name: "File Descriptors",
+		},
+		XAxis: chart.XAxis{
+			ValueFormatter: chart.TimeMinuteValueFormatter,
+			GridMajorStyle: chart.Style{
+				StrokeColor: chart.ColorAlternateGray,
+				StrokeWidth: 1.0,
+			},
+		},
+		Series: []chart.Series{
+			fds,
+		},
+	}
+
+	graph.Elements = []chart.Renderable{
+		chart.LegendThin(&graph),
+	}
+
+	f, _ := os.Create(r.genFilename("open_fds"))
+	defer f.Close()
+	graph.Render(chart.PNG, f)
+
+	return "open_fds"
+}
+
+func (r *Report) PlotMemoryArea(area string) string {
 	used := r.GenerateSeries(
 		fmt.Sprintf("Used memory [%s]", area),
 		fmt.Sprintf(`jvm_memory_bytes_used{area="%s"}`, area),
@@ -94,11 +251,30 @@ func (r *Report) PlotMemoryArea(area string) {
 		fmt.Sprintf(`jvm_memory_bytes_used{area="%s"} / jvm_memory_bytes_max >= 0`, area),
 		1*time.Hour)
 
+	usage.Style = chart.Style{
+		StrokeColor: chart.ColorRed,
+		FillColor:   chart.ColorRed.WithAlpha(100),
+	}
+	usage.YAxis = chart.YAxisSecondary
+
 	graph := chart.Chart{
 		Background: chart.Style{
 			Padding: chart.Box{
-				Top:  20,
-				Left: 20,
+				Bottom: 20,
+			},
+		},
+		YAxis: chart.YAxis{
+			Name:           "Memory",
+			ValueFormatter: ByteCountSI,
+		},
+		YAxisSecondary: chart.YAxis{
+			Name: "% usage",
+		},
+		XAxis: chart.XAxis{
+			ValueFormatter: chart.TimeMinuteValueFormatter,
+			GridMajorStyle: chart.Style{
+				StrokeColor: chart.ColorAlternateGray,
+				StrokeWidth: 1.0,
 			},
 		},
 		Series: []chart.Series{
@@ -109,16 +285,70 @@ func (r *Report) PlotMemoryArea(area string) {
 	}
 
 	graph.Elements = []chart.Renderable{
-		chart.Legend(&graph),
+		chart.LegendThin(&graph),
 	}
 
-	f, _ := os.Create(r.genFilename(fmt.Sprintf("memory_area_%s", area)))
+	filename := fmt.Sprintf("memory_area_%s", area)
+	f, _ := os.Create(r.genFilename(filename))
 	defer f.Close()
-	graph.Render(chart.SVG, f)
+	graph.Render(chart.PNG, f)
+
+	return filename
+}
+
+func (r *Report) PlotMemoryPool(pool string) string {
+	used := r.GenerateSeries(
+		fmt.Sprintf("Used memory [%s]", pool),
+		fmt.Sprintf(`jvm_memory_pool_bytes_used{pool="%s"}`, pool),
+		1*time.Hour)
+
+	max := r.GenerateSeries(
+		fmt.Sprintf("Max memory [%s]", pool),
+		fmt.Sprintf(`jvm_memory_pool_bytes_max{pool="%s"}`, pool),
+		1*time.Hour)
+
+	commited := r.GenerateSeries(
+		fmt.Sprintf("Usage memory [%s]", pool),
+		fmt.Sprintf(`jvm_memory_pool_bytes_committed{pool="%s"}`, pool),
+		1*time.Hour)
+
+	graph := chart.Chart{
+		Background: chart.Style{
+			Padding: chart.Box{
+				Bottom: 20,
+			},
+		},
+		YAxis: chart.YAxis{
+			Name:           "Memory",
+			ValueFormatter: ByteCountSI,
+		},
+		XAxis: chart.XAxis{
+			ValueFormatter: chart.TimeMinuteValueFormatter,
+			GridMajorStyle: chart.Style{
+				StrokeColor: chart.ColorAlternateGray,
+				StrokeWidth: 1.0,
+			},
+		},
+		Series: []chart.Series{
+			used,
+			max,
+			commited,
+		},
+	}
+
+	graph.Elements = []chart.Renderable{
+		chart.LegendThin(&graph),
+	}
+	filename := fmt.Sprintf("memory_pool_%s", pool)
+	f, _ := os.Create(r.genFilename(filename))
+	defer f.Close()
+	graph.Render(chart.PNG, f)
+
+	return filename
 }
 
 func (r *Report) genFilename(plot string) string {
-	return fmt.Sprintf("%s/%s.svg", r.baseDir, plot)
+	return fmt.Sprintf("%s/%s.png", r.baseDir, plot)
 }
 
 func (r *Report) MemoryAreaLabels() []string {

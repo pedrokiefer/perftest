@@ -2,6 +2,7 @@
 package prom
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -9,9 +10,8 @@ import (
 	"net/http"
 	"time"
 
-	io_prometheus_client "github.com/prometheus/client_model/go"
-	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
@@ -26,8 +26,10 @@ type EmbeddedPrometheus struct {
 	Expression string
 
 	Storage *teststorage.TestStorage
+	Engine  *promql.Engine
 
 	stop chan bool
+	req  *http.Request
 }
 
 func New(url string, interval time.Duration) *EmbeddedPrometheus {
@@ -38,6 +40,12 @@ func New(url string, interval time.Duration) *EmbeddedPrometheus {
 	}
 
 	ep.Storage = teststorage.New(&log.Logger{})
+	ep.Engine = promql.NewEngine(promql.EngineOpts{
+		MaxSamples:    50000000,
+		LookbackDelta: time.Minute * 5,
+		Timeout:       time.Second * 10,
+	})
+
 	ep.stop = make(chan bool)
 
 	return ep
@@ -57,7 +65,7 @@ func (ep *EmbeddedPrometheus) Start() {
 				ep.Ticker.Stop()
 				return
 			case <-ep.Ticker.C:
-				ep.Scrape()
+				ep.Scrape(context.Background())
 			}
 		}
 	}()
@@ -67,18 +75,15 @@ func (ep *EmbeddedPrometheus) Stop() {
 	ep.stop <- true
 }
 
-func (ep *EmbeddedPrometheus) Scrape() {
-	reader, err := readerForURL(ep.ScrapeURL)
+func (ep *EmbeddedPrometheus) Scrape(ctx context.Context) {
+	buf := bytes.NewBuffer([]byte{})
+	contentType, err := ep.readerForURL(ctx, buf)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	metricsFamilies, err := decodeMetrics(reader)
-	if err != nil {
-		log.Fatalf("Could not decode prometheus metrics: err=%s", err.Error())
-	}
-	reader.Close()
 
-	err = ingestMetrics(ep.Storage, metricsFamilies)
+	b := buf.Bytes()
+	err = ep.Append(b, contentType)
 	if err != nil {
 		log.Fatalf("Could not ingest prometheus metrics: err=%s", err.Error())
 	}
@@ -100,12 +105,7 @@ func (ep *EmbeddedPrometheus) Scrape() {
 }
 
 func (ep *EmbeddedPrometheus) ExecuteInstantQuery(expr string) *promql.Result {
-	engine := promql.NewEngine(promql.EngineOpts{
-		MaxSamples:    10000,
-		LookbackDelta: time.Minute * 5,
-		Timeout:       time.Second * 10,
-	})
-	query, err := engine.NewInstantQuery(ep.Storage, expr, timestamp.Time(time.Now().Unix()))
+	query, err := ep.Engine.NewInstantQuery(ep.Storage, expr, time.Now())
 	if err != nil {
 		log.Fatalf("Could not create query: err=%s", err.Error())
 	}
@@ -113,18 +113,13 @@ func (ep *EmbeddedPrometheus) ExecuteInstantQuery(expr string) *promql.Result {
 }
 
 func (ep *EmbeddedPrometheus) ExecuteRangeQuery(expr string, r time.Duration) *promql.Result {
-	engine := promql.NewEngine(promql.EngineOpts{
-		MaxSamples:    10000,
-		LookbackDelta: time.Minute * 5,
-		Timeout:       time.Second * 10,
-	})
 	end := time.Now()
 	begin := end.Add(-r)
-	query, err := engine.NewRangeQuery(
+	query, err := ep.Engine.NewRangeQuery(
 		ep.Storage,
 		expr,
 		begin, end,
-		time.Second)
+		15*time.Second)
 
 	if err != nil {
 		log.Fatalf("Could not create query: err=%s", err.Error())
@@ -132,71 +127,91 @@ func (ep *EmbeddedPrometheus) ExecuteRangeQuery(expr string, r time.Duration) *p
 	return query.Exec(context.Background())
 }
 
-func readerForURL(url string) (io.ReadCloser, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("Could not get URL: %s, err=%s", url, err.Error())
+func (ep *EmbeddedPrometheus) readerForURL(ctx context.Context, w io.Writer) (string, error) {
+	if ep.req == nil {
+		req, err := http.NewRequest(http.MethodGet, ep.ScrapeURL, nil)
+		if err != nil {
+			return "", err
+		}
+		ep.req = req
 	}
+	resp, err := http.DefaultClient.Do(ep.req.WithContext(ctx))
+	if err != nil {
+		return "", fmt.Errorf("Could not get URL: %s, err=%s", ep.ScrapeURL, err.Error())
+	}
+
 	if resp.StatusCode >= http.StatusBadRequest {
 		resp.Body.Close()
-		return nil, fmt.Errorf("Could not get URL: %s, statusCode=%d", url, resp.StatusCode)
+		return "", fmt.Errorf("Could not get URL: %s, statusCode=%d", ep.ScrapeURL, resp.StatusCode)
 	}
 
-	return resp.Body, nil
-}
-
-func ingestMetrics(st storage.Storage, metricsFamilies []*io_prometheus_client.MetricFamily) error {
-	appender := st.Appender(context.Background())
-
-	now := time.Now().Round(time.Second)
-	for _, mf := range metricsFamilies {
-		for _, m := range mf.Metric {
-			metricLabels := labels.FromStrings(labels.MetricName, mf.GetName())
-			for _, label := range m.Label {
-				metricLabels = append(metricLabels, labels.Label{
-					Name:  label.GetName(),
-					Value: label.GetValue(),
-				})
-			}
-			var value float64
-			if m.Counter != nil {
-				value = m.Counter.GetValue()
-
-			} else if m.Gauge != nil {
-				value = m.Gauge.GetValue()
-			} else if m.Histogram != nil {
-				log.Println("TODO ingest histogram")
-			} else if m.Summary != nil {
-				value = m.Summary.GetSampleSum()
-			} else if m.Untyped != nil {
-				value = m.Untyped.GetValue()
-				fmt.Println(m)
-			}
-
-			_, err := appender.Add(metricLabels, now.Unix(), value)
-			if err != nil {
-				return err
-			}
-		}
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		return "", err
 	}
-	return appender.Commit()
+
+	return resp.Header.Get("Content-Type"), nil
 }
 
-func decodeMetrics(r io.Reader) ([]*io_prometheus_client.MetricFamily, error) {
-	decoder := expfmt.NewDecoder(r, expfmt.FmtText)
+func (ep *EmbeddedPrometheus) Append(b []byte, contentType string) (err error) {
+	appender := ep.Storage.Appender(context.Background())
+	p := textparse.New(b, contentType)
+	defTime := timestamp.FromTime(time.Now())
 
-	metricFamilies := []*io_prometheus_client.MetricFamily{}
+loop:
 	for {
-		mf := &io_prometheus_client.MetricFamily{}
-		err := decoder.Decode(mf)
-		if err == io.EOF {
+		var et textparse.Entry
+		if et, err = p.Next(); err != nil {
+			if err == io.EOF {
+				err = nil
+			}
 			break
 		}
-		if err != nil {
-			return nil, err
-		}
-		metricFamilies = append(metricFamilies, mf)
-	}
 
-	return metricFamilies, nil
+		switch et {
+		case textparse.EntryType:
+			// ep.cache.setType(p.Type())
+			continue
+		case textparse.EntryHelp:
+			// ep.cache.setHelp(p.Help())
+			continue
+		case textparse.EntryUnit:
+			// ep.cache.setUnit(p.Unit())
+			continue
+		case textparse.EntryComment:
+			continue
+		default:
+		}
+		t := defTime
+		met, tp, v := p.Series()
+		if tp != nil {
+			t = *tp
+		}
+
+		var lset labels.Labels
+		p.Metric(&lset)
+		// The label set may be set to nil to indicate dropping.
+		if lset == nil {
+			continue
+		}
+
+		// log.Printf("Metric: %#v V: %#v t: %#v", lset, v, t)
+
+		if !lset.Has(labels.MetricName) {
+			err = fmt.Errorf("missing metric name (%s label)", labels.MetricName)
+			break loop
+		}
+
+		_, err = appender.Add(lset, t, v)
+		if err != nil {
+			if err != storage.ErrNotFound {
+				err = fmt.Errorf("Unexpected error series %s err %v", string(met), err)
+			}
+			break loop
+		}
+	}
+	if err == nil {
+		appender.Commit()
+	}
+	return
 }

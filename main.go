@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
 	"time"
 
@@ -29,40 +30,39 @@ func main() {
 	flag.IntVar(&parallel, "parallel", 5, "Number of concurrent requests")
 	flag.Parse()
 
-	// hosts := genVirtuaHosts(vhosts)
+	hosts := genVirtuaHosts(vhosts)
 
 	p := prom.New(metrics, time.Duration(10)*time.Second)
+	p.Expression = "jvm_memory_bytes_used"
 	p.Start()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	// for i := 0; i < parallel; i++ {
-	// 	log.Printf("%d parallel started", i)
-	// 	go func() {
-	// 		for {
-	// 			select {
-	// 			case <-time.After(10 * time.Second):
-	// 				picked := rand.Intn(vhosts)
-	// 				log.Printf("picked: [%s]", hosts[picked])
-	// 				client.DoFireAndForgetHTTPReq(endpoint, hosts[picked], 10*time.Second, nil, nil)
-	// 			case <-ctx.Done():
-	// 				return
-	// 			}
-	// 		}
-	// 	}()
-	// }
+	for i := 0; i < parallel; i++ {
+		go func() {
+			for {
+				select {
+				case <-time.After(1 * time.Second):
+					picked := rand.Intn(vhosts)
+					log.Printf("picked: [%s]", hosts[picked])
+					client.DoFireAndForgetHTTPReq(endpoint, hosts[picked], 10*time.Second, nil, nil)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
-	// // __ping__
-	// go func() {
-	// 	for {
-	// 		log.Print("picked: [__ping__]")
-	// 		select {
-	// 		case <-time.After(30 * time.Second):
-	// 			client.DoFireAndForgetHTTPReq(endpoint, "__ping__", 10*time.Second, nil, nil)
-	// 		case <-ctx.Done():
-	// 			return
-	// 		}
-	// 	}
-	// }()
+	// __ping__
+	go func() {
+		for {
+			select {
+			case <-time.After(30 * time.Second):
+				client.DoFireAndForgetHTTPReq(endpoint, "__ping__", 10*time.Second, nil, nil)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// __info__
 	go func() {
