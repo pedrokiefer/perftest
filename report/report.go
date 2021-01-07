@@ -95,11 +95,21 @@ func (r *Report) PlotMemoryArea(area string) {
 		1*time.Hour)
 
 	graph := chart.Chart{
+		Background: chart.Style{
+			Padding: chart.Box{
+				Top:  20,
+				Left: 20,
+			},
+		},
 		Series: []chart.Series{
 			used,
 			max,
 			usage,
 		},
+	}
+
+	graph.Elements = []chart.Renderable{
+		chart.Legend(&graph),
 	}
 
 	f, _ := os.Create(r.genFilename(fmt.Sprintf("memory_area_%s", area)))
